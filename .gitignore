@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files
+data/
+
+# Processed data
+processed_data/
+
+# Model outputs
+model_autokeras/
+moonboard_model/
+image_regressor/
+model_output/
+
+# OS
+.DS_Store
+Thumbs.db
