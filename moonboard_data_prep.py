@@ -148,7 +148,7 @@ def prepare_moonboard_data(json_file, test_size=1000, random_state=42, output_di
     
     print("Splitting data...")
     x_train, x_test, y_train, y_test = train_test_split(
-        x_all, y_all, test_size=test_size, random_state=random_state
+        x_all, y_all, test_size=test_size, random_state=random_state, stratify=y_all
     )
     
     print(f"Data split complete:")

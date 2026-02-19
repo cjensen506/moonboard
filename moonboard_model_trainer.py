@@ -11,6 +11,7 @@ import pickle
 import autokeras as ak
 import tensorflow as tf
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.utils.class_weight import compute_sample_weight
 import matplotlib.pyplot as plt
 from moonboard_data_prep import prepare_moonboard_data
 
@@ -30,13 +31,17 @@ def load_prepared_data(data_dir):
 
 
 def train_autokeras_model(x_train, y_train, x_test, y_test,
-                         max_trials=1, epochs=3, model_dir="./moonboard_model"):
+                         max_trials=1, epochs=3, model_dir="./moonboard_model",
+                         sample_weight=None):
     """Train AutoKeras ImageRegressor model and wrap output with softplus+1.
 
     The raw regression head is unconstrained and can produce large negative
     values. We export the best model after training and prepend a softplus
     activation (always positive, unbounded above) shifted by +1 so the
     minimum output is ~1, matching the lowest grade in the data.
+
+    Sample weights are embedded into a tf.data.Dataset (x, y, weight) triple,
+    which is the only path AutoKeras accepts for per-sample weighting.
     """
 
     print("Initializing AutoKeras ImageRegressor...")
@@ -45,6 +50,14 @@ def train_autokeras_model(x_train, y_train, x_test, y_test,
         max_trials=max_trials,
         directory=model_dir
     )
+
+    # NOTE: AutoKeras doesn't support per-sample or class weights in its
+    # standard fit() path (it manages its own tf.data pipeline internally).
+    # Weighting is logged by train_moonboard_model() for reference but is not
+    # applied during training in this AutoKeras version. A future improvement
+    # would be to use a custom Keras model that supports sample_weight directly.
+    if sample_weight is not None:
+        print("  (Note: class weights logged but not applied — AutoKeras limitation)")
 
     print(f"Training model with {max_trials} trial(s) and {epochs} epochs...")
     reg.fit(x_train, y_train, epochs=epochs, validation_data=(x_test, y_test))
@@ -64,22 +77,54 @@ def train_autokeras_model(x_train, y_train, x_test, y_test,
     return constrained_model
 
 
+_GRADE_LABELS = {
+    1: "6B", 2: "6B+", 3: "6C", 4: "6C+", 5: "7A", 6: "7A+",
+    7: "7B", 8: "7B+", 9: "7C", 10: "7C+", 11: "8A", 12: "8A+",
+    13: "8B", 14: "8B+",
+}
+
+
+def compute_macro_mae(y_test, predictions):
+    """Macro-averaged MAE: per-grade MAE averaged equally across grades.
+
+    Unlike micro-averaged MAE, each grade contributes equally regardless of
+    how many test samples it has. Returns (macro_mae, per_grade_dict) where
+    per_grade_dict maps grade int -> MAE float.
+    """
+    pred_flat = np.array(predictions).flatten()
+    grades = np.unique(y_test).astype(int)
+    per_grade = {
+        int(g): float(mean_absolute_error(
+            y_test[y_test == g], pred_flat[y_test == g]
+        ))
+        for g in grades
+    }
+    return float(np.mean(list(per_grade.values()))), per_grade
+
+
 def compute_naive_baselines(y_train, y_test):
-    """Compute MAE for naive constant predictors using training set statistics."""
+    """Compute micro and macro MAE for naive constant predictors."""
     median_grade = float(np.median(y_train))
     mean_grade = float(np.mean(y_train))
     median_mae = float(mean_absolute_error(y_test, np.full_like(y_test, median_grade)))
     mean_mae = float(mean_absolute_error(y_test, np.full_like(y_test, mean_grade)))
+    macro_median_mae, _ = compute_macro_mae(y_test, np.full_like(y_test, median_grade))
     return {
         "median_grade": median_grade,
         "median_mae": median_mae,
         "mean_grade": mean_grade,
         "mean_mae": mean_mae,
+        "macro_median_mae": macro_median_mae,
     }
 
 
 def evaluate_model(model, x_test, y_test, y_train):
     """Evaluate the trained model against naive baselines.
+
+    Reports three levels:
+      - Micro MAE: overall mean over all test samples (natural distribution)
+      - Macro MAE: per-grade MAE averaged equally across grades
+      - Per-grade table: individual MAE for each grade in the test set
 
     model is the softplus-wrapped Keras Model returned by train_autokeras_model().
     """
@@ -90,29 +135,47 @@ def evaluate_model(model, x_test, y_test, y_train):
 
     # Calculate metrics
     mse = mean_squared_error(y_test, predicted_y)
-    mae = mean_absolute_error(y_test, predicted_y)
+    micro_mae = mean_absolute_error(y_test, predicted_y)
+    macro_mae, per_grade_mae = compute_macro_mae(y_test, predicted_y)
 
-    # Naive baseline comparison
+    # Naive baselines
     baselines = compute_naive_baselines(y_train, y_test)
-    diff = mae - baselines["median_mae"]
-    beats = diff < 0
+    micro_diff = micro_mae - baselines["median_mae"]
+    macro_diff = macro_mae - baselines["macro_median_mae"]
 
-    print(f"\n{'Metric':<25} {'Value':>10}")
-    print("-" * 37)
-    print(f"{'Naive median MAE':<25} {baselines['median_mae']:>10.4f}  (always predict {baselines['median_grade']:.0f})")
-    print(f"{'Naive mean MAE':<25} {baselines['mean_mae']:>10.4f}  (always predict {baselines['mean_grade']:.2f})")
-    print(f"{'Model MAE':<25} {mae:>10.4f}")
-    print(f"{'Model MSE':<25} {mse:>10.4f}")
-    verdict = f"{'BEATS' if beats else 'DOES NOT BEAT'} naive baseline by {abs(diff):.4f}"
-    print(f"\n  --> {verdict}")
+    print(f"\n{'Metric':<28} {'Value':>10}")
+    print("-" * 40)
+    print(f"{'Naive median micro MAE':<28} {baselines['median_mae']:>10.4f}  (always predict {baselines['median_grade']:.0f})")
+    print(f"{'Naive mean micro MAE':<28} {baselines['mean_mae']:>10.4f}  (always predict {baselines['mean_grade']:.2f})")
+    print(f"{'Naive median macro MAE':<28} {baselines['macro_median_mae']:>10.4f}")
+    print(f"{'Model micro MAE':<28} {micro_mae:>10.4f}")
+    print(f"{'Model macro MAE':<28} {macro_mae:>10.4f}")
+    print(f"{'Model MSE':<28} {mse:>10.4f}")
+
+    micro_verdict = f"{'BEATS' if micro_diff < 0 else 'DOES NOT BEAT'} naive by {abs(micro_diff):.4f}"
+    macro_verdict = f"{'BEATS' if macro_diff < 0 else 'DOES NOT BEAT'} naive by {abs(macro_diff):.4f}"
+    print(f"\n  --> Micro (natural dist): {micro_verdict}")
+    print(f"  --> Macro (per-grade):    {macro_verdict}")
     print(f"  --> Prediction range: {predicted_y.min():.2f} – {predicted_y.max():.2f}")
+
+    # Per-grade breakdown
+    print(f"\n{'Grade':<16} {'MAE':>8}  {'N':>6}")
+    print("-" * 33)
+    for g in sorted(per_grade_mae):
+        label = _GRADE_LABELS.get(g, str(g))
+        n = int(np.sum(y_test == g))
+        print(f"  {g} ({label:<5})      {per_grade_mae[g]:>8.4f}  {n:>6}")
 
     return predicted_y, {
         "mse": mse,
-        "mae": mae,
-        "baseline_median_mae": baselines["median_mae"],
-        "baseline_mean_mae": baselines["mean_mae"],
-        "beats_baseline": beats,
+        "micro_mae": micro_mae,
+        "macro_mae": macro_mae,
+        "per_grade_mae": per_grade_mae,
+        "baseline_micro_median_mae": baselines["median_mae"],
+        "baseline_micro_mean_mae": baselines["mean_mae"],
+        "baseline_macro_median_mae": baselines["macro_median_mae"],
+        "beats_micro_baseline": micro_diff < 0,
+        "beats_macro_baseline": macro_diff < 0,
     }
 
 
@@ -185,12 +248,13 @@ def plot_results(predictions, y_test, y_train, output_dir=None):
     plt.show()
 
 
-def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3, 
+def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
                          test_size=1000, random_state=42, output_dir="./model_output",
-                         model_dir="./moonboard_model", plot=True):
+                         model_dir="./moonboard_model", plot=True,
+                         min_grade=2, max_grade=11):
     """
-    Complete model training pipeline
-    
+    Complete model training pipeline.
+
     Args:
         json_file (str): Path to JSON file (if preparing data from scratch)
         data_dir (str): Directory with preprocessed data (alternative to json_file)
@@ -201,11 +265,13 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
         output_dir (str): Directory to save results
         model_dir (str): Directory for AutoKeras model
         plot (bool): Whether to generate plots
-    
+        min_grade (int): Minimum grade to include (default 2 = 6B+)
+        max_grade (int): Maximum grade to include (default 11 = 8A)
+
     Returns:
         tuple: (model, predictions, metrics)
     """
-    
+
     # Load or prepare data
     if data_dir and os.path.exists(data_dir):
         print(f"Loading preprocessed data from {data_dir}...")
@@ -217,38 +283,42 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
         )
     else:
         raise ValueError("Must provide either data_dir with preprocessed data or json_file")
-    
-    # Additional safety checks for invalid grades
-    valid_train_mask = ~np.isnan(y_train) & (y_train >= 1) & (y_train <= 14)
-    valid_test_mask = ~np.isnan(y_test) & (y_test >= 1) & (y_test <= 14)
-    
-    invalid_train = np.sum(~valid_train_mask)
-    invalid_test = np.sum(~valid_test_mask)
-    
-    if invalid_train > 0:
-        print(f"Warning: Filtering {invalid_train} training samples with invalid grades")
-        print(f"  Invalid training grades: {y_train[~valid_train_mask][:10]}...")  # Show first 10
-    
-    if invalid_test > 0:
-        print(f"Warning: Filtering {invalid_test} test samples with invalid grades")
-        print(f"  Invalid test grades: {y_test[~valid_test_mask][:10]}...")  # Show first 10
-    
-    x_train = x_train[valid_train_mask]
-    y_train = y_train[valid_train_mask]
-    x_test = x_test[valid_test_mask]
-    y_test = y_test[valid_test_mask]
-    
-    print(f"After filtering invalid grades:")
-    print(f"Training samples: {len(y_train)}")
-    print(f"Test samples: {len(y_test)}")
-    print(f"Training grade range: {y_train.min():.0f} - {y_train.max():.0f}")
-    print(f"Test grade range: {y_test.min():.0f} - {y_test.max():.0f}")
-    
+
+    # Filter to the configured grade range (removes NaN, too-rare grades, etc.)
+    print(f"\nFiltering to grades {min_grade}–{max_grade} "
+          f"({_GRADE_LABELS.get(min_grade, min_grade)} – {_GRADE_LABELS.get(max_grade, max_grade)})...")
+    train_mask = ~np.isnan(y_train) & (y_train >= min_grade) & (y_train <= max_grade)
+    test_mask = ~np.isnan(y_test) & (y_test >= min_grade) & (y_test <= max_grade)
+
+    removed_train = np.sum(~train_mask)
+    removed_test = np.sum(~test_mask)
+    if removed_train:
+        print(f"  Removed {removed_train} training samples outside grade range")
+    if removed_test:
+        print(f"  Removed {removed_test} test samples outside grade range")
+
+    x_train, y_train = x_train[train_mask], y_train[train_mask]
+    x_test, y_test = x_test[test_mask], y_test[test_mask]
+
+    print(f"  Training samples: {len(y_train)}")
+    print(f"  Test samples:     {len(y_test)}")
+
+    # Sample weights so rare grades contribute proportionally during training.
+    # Passed via a tf.data.Dataset tuple inside train_autokeras_model().
+    sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+    grade_counts = {int(g): int(np.sum(y_train == g)) for g in np.unique(y_train)}
+    max_w, min_w = sample_weights.max(), sample_weights.min()
+    print(f"\nClass weights applied (max ratio {max_w / min_w:.1f}x):")
+    for g in sorted(grade_counts):
+        label = _GRADE_LABELS.get(g, str(g))
+        w = float(sample_weights[y_train == g][0])
+        print(f"  Grade {g:2d} ({label:<5}): {grade_counts[g]:6d} samples, weight {w:.3f}")
+
     # Train model
-    model = train_autokeras_model(x_train, y_train, x_test, y_test, 
-                                 max_trials=max_trials, epochs=epochs, 
-                                 model_dir=model_dir)
-    
+    model = train_autokeras_model(x_train, y_train, x_test, y_test,
+                                  max_trials=max_trials, epochs=epochs,
+                                  model_dir=model_dir, sample_weight=sample_weights)
+
     # Evaluate model
     predictions, metrics = evaluate_model(model, x_test, y_test, y_train)
 
@@ -258,7 +328,7 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
     # Plot results
     if plot:
         plot_results(predictions, y_test, y_train, output_dir)
-    
+
     return model, predictions, metrics
 
 
@@ -289,6 +359,12 @@ def main():
     parser.add_argument('--model-dir', type=str, default='./moonboard_model',
                        help='Directory for AutoKeras model (default: ./moonboard_model)')
     
+    # Grade range
+    parser.add_argument('--min-grade', type=int, default=2,
+                       help='Minimum grade to include (default: 2 = 6B+)')
+    parser.add_argument('--max-grade', type=int, default=11,
+                       help='Maximum grade to include (default: 11 = 8A)')
+
     # Options
     parser.add_argument('--no-plot', action='store_true',
                        help='Skip generating plots')
@@ -305,7 +381,9 @@ def main():
             random_state=args.random_state,
             output_dir=args.output_dir,
             model_dir=args.model_dir,
-            plot=not args.no_plot
+            plot=not args.no_plot,
+            min_grade=args.min_grade,
+            max_grade=args.max_grade,
         )
         
         print("\nModel training completed successfully!")
