@@ -32,7 +32,7 @@ def load_prepared_data(data_dir):
 
 def train_autokeras_model(x_train, y_train, x_test, y_test,
                          max_trials=1, epochs=3, model_dir="./moonboard_model",
-                         sample_weight=None):
+                         sample_weight=None, tuner="greedy"):
     """Train AutoKeras ImageRegressor model and wrap output with softplus+1.
 
     The raw regression head is unconstrained and can produce large negative
@@ -40,15 +40,16 @@ def train_autokeras_model(x_train, y_train, x_test, y_test,
     activation (always positive, unbounded above) shifted by +1 so the
     minimum output is ~1, matching the lowest grade in the data.
 
-    Sample weights are embedded into a tf.data.Dataset (x, y, weight) triple,
-    which is the only path AutoKeras accepts for per-sample weighting.
+    tuner: "greedy" (default), "bayesian", "hyperband", or "random".
+    Bayesian is recommended when max_trials > 5 for smarter architecture search.
     """
 
-    print("Initializing AutoKeras ImageRegressor...")
+    print(f"Initializing AutoKeras ImageRegressor (tuner={tuner})...")
     reg = ak.ImageRegressor(
         overwrite=True,
         max_trials=max_trials,
-        directory=model_dir
+        directory=model_dir,
+        tuner=tuner,
     )
 
     # NOTE: AutoKeras doesn't support per-sample or class weights in its
@@ -75,6 +76,79 @@ def train_autokeras_model(x_train, y_train, x_test, y_test,
     )
 
     return constrained_model
+
+
+def train_custom_model(x_train, y_train, x_test, y_test,
+                       arch="cnn", epochs=50, model_dir="./moonboard_model",
+                       sample_weight=None):
+    """Train a lightweight custom Keras model with optional class weights.
+
+    Unlike train_autokeras_model(), sample_weight is passed directly to
+    model.fit(), so class-weighted training actually works here.
+
+    Both architectures accept shape (18, 11) inputs to match the preprocessed
+    arrays, so evaluate_model() can be called unchanged.
+
+    arch:
+      "mlp" — flatten to dense layers; ignores spatial structure of the grid
+      "cnn" — small 2-D conv net; the channel dim is added inside the model
+    """
+    inputs = tf.keras.Input(shape=(18, 11))
+
+    if arch == "mlp":
+        x = tf.keras.layers.Flatten()(inputs)
+        x = tf.keras.layers.Dense(512, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.3)(x)
+        x = tf.keras.layers.Dense(256, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.3)(x)
+        x = tf.keras.layers.Dense(64, activation='relu')(x)
+        out = tf.keras.layers.Dense(1)(x)
+    elif arch == "cnn":
+        # Expand to (18, 11, 1) inside the model so the external interface
+        # stays (18, 11), matching the preprocessed arrays.
+        x = tf.keras.layers.Lambda(lambda t: tf.expand_dims(t, -1))(inputs)
+        x = tf.keras.layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+        x = tf.keras.layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+        x = tf.keras.layers.Dense(64, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.3)(x)
+        out = tf.keras.layers.Dense(1)(x)
+    else:
+        raise ValueError(f"Unknown arch: {arch!r}. Choose 'mlp' or 'cnn'.")
+
+    # Softplus+1 output: always >= ~1, unbounded above — same as AutoKeras path.
+    out = tf.keras.layers.Lambda(
+        lambda t: tf.nn.softplus(t) + 1, name="grade_output"
+    )(out)
+    model = tf.keras.Model(inputs=inputs, outputs=out)
+    model.compile(optimizer='adam', loss='mae')
+
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            patience=5, restore_best_weights=True, monitor='val_loss'
+        )
+    ]
+
+    print(f"Training custom {arch.upper()} model for up to {epochs} epochs...")
+    if sample_weight is not None:
+        print("  Class weights applied via sample_weight.")
+
+    model.fit(
+        x_train, y_train,
+        epochs=epochs,
+        validation_data=(x_test, y_test),
+        sample_weight=sample_weight,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    # Save explicitly — AutoKeras is not involved for this path.
+    os.makedirs(model_dir, exist_ok=True)
+    save_path = os.path.join(model_dir, f"custom_{arch}_model")
+    model.save(save_path)
+    print(f"Custom model saved to {save_path}")
+
+    return model
 
 
 _GRADE_LABELS = {
@@ -183,8 +257,7 @@ def save_model_and_results(model, predictions, metrics, y_test, output_dir):
     """Save the trained model and results"""
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save model (AutoKeras handles this automatically in the model directory)
-    print(f"Model saved in AutoKeras directory")
+    print("Model saved")
     
     # Save predictions and actual values
     np.save(os.path.join(output_dir, 'predictions.npy'), predictions)
@@ -251,22 +324,25 @@ def plot_results(predictions, y_test, y_train, output_dir=None):
 def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
                          test_size=1000, random_state=42, output_dir="./model_output",
                          model_dir="./moonboard_model", plot=True,
-                         min_grade=2, max_grade=11):
+                         min_grade=2, max_grade=11,
+                         model_type="autokeras", tuner="greedy"):
     """
     Complete model training pipeline.
 
     Args:
         json_file (str): Path to JSON file (if preparing data from scratch)
         data_dir (str): Directory with preprocessed data (alternative to json_file)
-        max_trials (int): Maximum AutoKeras trials
+        max_trials (int): Maximum AutoKeras trials (autokeras model_type only)
         epochs (int): Training epochs
         test_size (int): Test set size (only used if preparing from JSON)
         random_state (int): Random seed
         output_dir (str): Directory to save results
-        model_dir (str): Directory for AutoKeras model
+        model_dir (str): Directory for model artifacts
         plot (bool): Whether to generate plots
         min_grade (int): Minimum grade to include (default 2 = 6B+)
         max_grade (int): Maximum grade to include (default 11 = 8A)
+        model_type (str): "autokeras", "mlp", or "cnn"
+        tuner (str): AutoKeras tuner — "greedy", "bayesian", "hyperband", "random"
 
     Returns:
         tuple: (model, predictions, metrics)
@@ -303,21 +379,32 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
     print(f"  Training samples: {len(y_train)}")
     print(f"  Test samples:     {len(y_test)}")
 
-    # Sample weights so rare grades contribute proportionally during training.
-    # Passed via a tf.data.Dataset tuple inside train_autokeras_model().
+    # Compute class weights to counter grade imbalance.
+    # For custom models (mlp/cnn) these are passed to model.fit() via sample_weight.
+    # For autokeras, they are logged for reference only (AutoKeras limitation).
     sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
     grade_counts = {int(g): int(np.sum(y_train == g)) for g in np.unique(y_train)}
     max_w, min_w = sample_weights.max(), sample_weights.min()
-    print(f"\nClass weights applied (max ratio {max_w / min_w:.1f}x):")
+    applied = model_type in ("mlp", "cnn")
+    print(f"\nClass weights (max ratio {max_w / min_w:.1f}x) — "
+          f"{'APPLIED' if applied else 'logged only (AutoKeras limitation)'}:")
     for g in sorted(grade_counts):
         label = _GRADE_LABELS.get(g, str(g))
         w = float(sample_weights[y_train == g][0])
         print(f"  Grade {g:2d} ({label:<5}): {grade_counts[g]:6d} samples, weight {w:.3f}")
 
-    # Train model
-    model = train_autokeras_model(x_train, y_train, x_test, y_test,
-                                  max_trials=max_trials, epochs=epochs,
-                                  model_dir=model_dir, sample_weight=sample_weights)
+    # Train model — dispatch based on model_type
+    if model_type == "autokeras":
+        model = train_autokeras_model(x_train, y_train, x_test, y_test,
+                                      max_trials=max_trials, epochs=epochs,
+                                      model_dir=model_dir, sample_weight=sample_weights,
+                                      tuner=tuner)
+    elif model_type in ("mlp", "cnn"):
+        model = train_custom_model(x_train, y_train, x_test, y_test,
+                                   arch=model_type, epochs=epochs,
+                                   model_dir=model_dir, sample_weight=sample_weights)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type!r}. Choose 'autokeras', 'mlp', or 'cnn'.")
 
     # Evaluate model
     predictions, metrics = evaluate_model(model, x_test, y_test, y_train)
@@ -365,6 +452,15 @@ def main():
     parser.add_argument('--max-grade', type=int, default=11,
                        help='Maximum grade to include (default: 11 = 8A)')
 
+    # Model type and tuner
+    parser.add_argument('--model-type', type=str, default='autokeras',
+                       choices=['autokeras', 'mlp', 'cnn'],
+                       help='Model architecture: autokeras (NAS), mlp, or cnn (default: autokeras)')
+    parser.add_argument('--tuner', type=str, default='greedy',
+                       choices=['greedy', 'bayesian', 'hyperband', 'random'],
+                       help='AutoKeras tuner strategy (default: greedy). '
+                            'bayesian recommended for max-trials > 5.')
+
     # Options
     parser.add_argument('--no-plot', action='store_true',
                        help='Skip generating plots')
@@ -384,6 +480,8 @@ def main():
             plot=not args.no_plot,
             min_grade=args.min_grade,
             max_grade=args.max_grade,
+            model_type=args.model_type,
+            tuner=args.tuner,
         )
         
         print("\nModel training completed successfully!")
