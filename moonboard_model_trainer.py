@@ -29,42 +29,91 @@ def load_prepared_data(data_dir):
     return x_train, x_test, y_train, y_test
 
 
-def train_autokeras_model(x_train, y_train, x_test, y_test, 
+def train_autokeras_model(x_train, y_train, x_test, y_test,
                          max_trials=1, epochs=3, model_dir="./moonboard_model"):
-    """Train AutoKeras ImageRegressor model"""
-    
+    """Train AutoKeras ImageRegressor model and wrap output with softplus+1.
+
+    The raw regression head is unconstrained and can produce large negative
+    values. We export the best model after training and prepend a softplus
+    activation (always positive, unbounded above) shifted by +1 so the
+    minimum output is ~1, matching the lowest grade in the data.
+    """
+
     print("Initializing AutoKeras ImageRegressor...")
     reg = ak.ImageRegressor(
-        overwrite=True, 
+        overwrite=True,
         max_trials=max_trials,
         directory=model_dir
     )
-    
+
     print(f"Training model with {max_trials} trial(s) and {epochs} epochs...")
     reg.fit(x_train, y_train, epochs=epochs, validation_data=(x_test, y_test))
-    
-    return reg
+
+    # Wrap the best model with a softplus+1 output so predictions are
+    # always >= ~1 without imposing an upper bound on the grade scale.
+    print("Wrapping best model output with softplus+1...")
+    best_model = reg.export_model()
+    constrained_output = tf.keras.layers.Lambda(
+        lambda t: tf.nn.softplus(t) + 1,
+        name="softplus_grade_output"
+    )(best_model.output)
+    constrained_model = tf.keras.Model(
+        inputs=best_model.input, outputs=constrained_output
+    )
+
+    return constrained_model
 
 
-def evaluate_model(model, x_test, y_test):
-    """Evaluate the trained model"""
+def compute_naive_baselines(y_train, y_test):
+    """Compute MAE for naive constant predictors using training set statistics."""
+    median_grade = float(np.median(y_train))
+    mean_grade = float(np.mean(y_train))
+    median_mae = float(mean_absolute_error(y_test, np.full_like(y_test, median_grade)))
+    mean_mae = float(mean_absolute_error(y_test, np.full_like(y_test, mean_grade)))
+    return {
+        "median_grade": median_grade,
+        "median_mae": median_mae,
+        "mean_grade": mean_grade,
+        "mean_mae": mean_mae,
+    }
+
+
+def evaluate_model(model, x_test, y_test, y_train):
+    """Evaluate the trained model against naive baselines.
+
+    model is the softplus-wrapped Keras Model returned by train_autokeras_model().
+    """
     print("\nEvaluating model...")
-    
-    # Get predictions
+
+    # Get predictions (already constrained to >=1 via softplus+1 wrapper)
     predicted_y = model.predict(x_test)
-    
+
     # Calculate metrics
     mse = mean_squared_error(y_test, predicted_y)
     mae = mean_absolute_error(y_test, predicted_y)
-    
-    # AutoKeras evaluation
-    ak_evaluation = model.evaluate(x_test, y_test)
-    
-    print(f"Mean Squared Error: {mse:.4f}")
-    print(f"Mean Absolute Error: {mae:.4f}")
-    print(f"AutoKeras Evaluation: {ak_evaluation}")
-    
-    return predicted_y, {"mse": mse, "mae": mae, "ak_eval": ak_evaluation}
+
+    # Naive baseline comparison
+    baselines = compute_naive_baselines(y_train, y_test)
+    diff = mae - baselines["median_mae"]
+    beats = diff < 0
+
+    print(f"\n{'Metric':<25} {'Value':>10}")
+    print("-" * 37)
+    print(f"{'Naive median MAE':<25} {baselines['median_mae']:>10.4f}  (always predict {baselines['median_grade']:.0f})")
+    print(f"{'Naive mean MAE':<25} {baselines['mean_mae']:>10.4f}  (always predict {baselines['mean_grade']:.2f})")
+    print(f"{'Model MAE':<25} {mae:>10.4f}")
+    print(f"{'Model MSE':<25} {mse:>10.4f}")
+    verdict = f"{'BEATS' if beats else 'DOES NOT BEAT'} naive baseline by {abs(diff):.4f}"
+    print(f"\n  --> {verdict}")
+    print(f"  --> Prediction range: {predicted_y.min():.2f} – {predicted_y.max():.2f}")
+
+    return predicted_y, {
+        "mse": mse,
+        "mae": mae,
+        "baseline_median_mae": baselines["median_mae"],
+        "baseline_mean_mae": baselines["mean_mae"],
+        "beats_baseline": beats,
+    }
 
 
 def save_model_and_results(model, predictions, metrics, y_test, output_dir):
@@ -85,35 +134,54 @@ def save_model_and_results(model, predictions, metrics, y_test, output_dir):
     print(f"Results saved to {output_dir}")
 
 
-def plot_results(predictions, y_test, output_dir=None):
-    """Plot prediction vs actual results"""
-    plt.figure(figsize=(10, 6))
-    
+def plot_results(predictions, y_test, y_train, output_dir=None):
+    """Plot prediction vs actual results with naive baseline annotations."""
+    pred_flat = predictions.flatten()
+    baselines = compute_naive_baselines(y_train, y_test)
+    naive_median = baselines["median_grade"]
+    naive_mae = baselines["median_mae"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
     # Scatter plot
-    plt.subplot(1, 2, 1)
-    plt.scatter(y_test, predictions, alpha=0.6)
-    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
-    plt.xlabel('Actual Grade')
-    plt.ylabel('Predicted Grade')
-    plt.title('Predicted vs Actual Grades')
-    plt.grid(True, alpha=0.3)
-    
-    # Residuals plot
-    plt.subplot(1, 2, 2)
-    residuals = predictions.flatten() - y_test
-    plt.scatter(y_test, residuals, alpha=0.6)
-    plt.axhline(y=0, color='r', linestyle='--')
-    plt.xlabel('Actual Grade')
-    plt.ylabel('Residuals')
-    plt.title('Residuals Plot')
-    plt.grid(True, alpha=0.3)
-    
+    axes[0].scatter(y_test, pred_flat, alpha=0.4)
+    lims = [min(y_test.min(), pred_flat.min()), max(y_test.max(), pred_flat.max())]
+    axes[0].plot(lims, lims, 'r--', lw=2)
+    axes[0].set_xlabel('Actual Grade')
+    axes[0].set_ylabel('Predicted Grade')
+    axes[0].set_title('Predicted vs Actual Grades')
+    axes[0].grid(True, alpha=0.3)
+
+    # Residuals plot — shaded band shows naive baseline error range
+    residuals = pred_flat - y_test
+    axes[1].scatter(y_test, residuals, alpha=0.4)
+    axes[1].axhline(y=0, color='r', linestyle='--')
+    axes[1].axhspan(-naive_mae, naive_mae, alpha=0.12, color='green',
+                    label=f'Naive baseline ±{naive_mae:.2f}')
+    axes[1].set_xlabel('Actual Grade')
+    axes[1].set_ylabel('Residuals')
+    axes[1].set_title('Residuals Plot')
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    # Grade distribution comparison with naive baseline marker
+    bins = np.arange(0.5, max(y_test.max(), pred_flat.max()) + 1.5, 1)
+    axes[2].hist(y_test, bins=bins, alpha=0.6, label='Actual', color='steelblue')
+    axes[2].hist(pred_flat, bins=bins, alpha=0.6, label='Predicted', color='orange')
+    axes[2].axvline(x=naive_median, color='green', linestyle='--', lw=1.5,
+                    label=f'Naive baseline ({naive_median:.0f})')
+    axes[2].set_xlabel('Grade')
+    axes[2].set_ylabel('Count')
+    axes[2].set_title('Grade Distribution')
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+
     plt.tight_layout()
-    
+
     if output_dir:
         plt.savefig(os.path.join(output_dir, 'model_results.png'), dpi=300, bbox_inches='tight')
         print(f"Plot saved to {os.path.join(output_dir, 'model_results.png')}")
-    
+
     plt.show()
 
 
@@ -182,14 +250,14 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
                                  model_dir=model_dir)
     
     # Evaluate model
-    predictions, metrics = evaluate_model(model, x_test, y_test)
-    
+    predictions, metrics = evaluate_model(model, x_test, y_test, y_train)
+
     # Save results
     save_model_and_results(model, predictions, metrics, y_test, output_dir)
-    
+
     # Plot results
     if plot:
-        plot_results(predictions, y_test, output_dir)
+        plot_results(predictions, y_test, y_train, output_dir)
     
     return model, predictions, metrics
 
