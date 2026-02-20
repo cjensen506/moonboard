@@ -134,7 +134,7 @@ def train_custom_model(x_train, y_train, x_test, y_test,
     if sample_weight is not None:
         print("  Class weights applied via sample_weight.")
 
-    model.fit(
+    history = model.fit(
         x_train, y_train,
         epochs=epochs,
         validation_data=(x_test, y_test),
@@ -149,7 +149,7 @@ def train_custom_model(x_train, y_train, x_test, y_test,
     model.save(save_path)
     print(f"Custom model saved to {save_path}")
 
-    return model
+    return model, history
 
 
 _GRADE_LABELS = {
@@ -322,6 +322,33 @@ def plot_results(predictions, y_test, y_train, output_dir=None):
     plt.show()
 
 
+def plot_loss_curve(history, arch, output_dir=None):
+    """Plot training and validation MAE over epochs for a custom model."""
+    hist = history.history
+    epochs_ran = range(1, len(hist['loss']) + 1)
+
+    _, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs_ran, hist['loss'], label='Train MAE')
+    ax.plot(epochs_ran, hist['val_loss'], label='Val MAE')
+    best_epoch = int(np.argmin(hist['val_loss'])) + 1
+    best_val = min(hist['val_loss'])
+    ax.axvline(x=best_epoch, color='red', linestyle='--', alpha=0.6,
+               label=f'Best epoch {best_epoch} (val MAE {best_val:.3f})')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('MAE')
+    ax.set_title(f'{arch.upper()} Training Loss Curve')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if output_dir:
+        path = os.path.join(output_dir, 'loss_curve.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        print(f"Loss curve saved to {path}")
+
+    plt.show()
+
+
 def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
                          test_size=1000, random_state=42, output_dir="./model_output",
                          model_dir="./moonboard_model", plot=True,
@@ -401,9 +428,9 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
                                       model_dir=model_dir, sample_weight=sample_weights,
                                       tuner=tuner, overwrite=overwrite)
     elif model_type in ("mlp", "cnn"):
-        model = train_custom_model(x_train, y_train, x_test, y_test,
-                                   arch=model_type, epochs=epochs,
-                                   model_dir=model_dir, sample_weight=sample_weights)
+        model, history = train_custom_model(x_train, y_train, x_test, y_test,
+                                            arch=model_type, epochs=epochs,
+                                            model_dir=model_dir, sample_weight=sample_weights)
     else:
         raise ValueError(f"Unknown model_type: {model_type!r}. Choose 'autokeras', 'mlp', or 'cnn'.")
 
@@ -416,6 +443,8 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
     # Plot results
     if plot:
         plot_results(predictions, y_test, y_train, output_dir)
+        if model_type in ("mlp", "cnn"):
+            plot_loss_curve(history, model_type, output_dir)
 
     return model, predictions, metrics
 
