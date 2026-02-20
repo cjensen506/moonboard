@@ -32,7 +32,7 @@ def load_prepared_data(data_dir):
 
 def train_autokeras_model(x_train, y_train, x_test, y_test,
                          max_trials=1, epochs=3, model_dir="./moonboard_model",
-                         sample_weight=None, tuner="greedy"):
+                         sample_weight=None, tuner="greedy", overwrite=True):
     """Train AutoKeras ImageRegressor model and wrap output with softplus+1.
 
     The raw regression head is unconstrained and can produce large negative
@@ -42,11 +42,12 @@ def train_autokeras_model(x_train, y_train, x_test, y_test,
 
     tuner: "greedy" (default), "bayesian", "hyperband", or "random".
     Bayesian is recommended when max_trials > 5 for smarter architecture search.
+    overwrite: False to resume a previous search from checkpoints.
     """
 
-    print(f"Initializing AutoKeras ImageRegressor (tuner={tuner})...")
+    print(f"Initializing AutoKeras ImageRegressor (tuner={tuner}, overwrite={overwrite})...")
     reg = ak.ImageRegressor(
-        overwrite=True,
+        overwrite=overwrite,
         max_trials=max_trials,
         directory=model_dir,
         tuner=tuner,
@@ -325,7 +326,7 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
                          test_size=1000, random_state=42, output_dir="./model_output",
                          model_dir="./moonboard_model", plot=True,
                          min_grade=2, max_grade=11,
-                         model_type="autokeras", tuner="greedy"):
+                         model_type="autokeras", tuner="greedy", overwrite=True):
     """
     Complete model training pipeline.
 
@@ -398,7 +399,7 @@ def train_moonboard_model(json_file=None, data_dir=None, max_trials=1, epochs=3,
         model = train_autokeras_model(x_train, y_train, x_test, y_test,
                                       max_trials=max_trials, epochs=epochs,
                                       model_dir=model_dir, sample_weight=sample_weights,
-                                      tuner=tuner)
+                                      tuner=tuner, overwrite=overwrite)
     elif model_type in ("mlp", "cnn"):
         model = train_custom_model(x_train, y_train, x_test, y_test,
                                    arch=model_type, epochs=epochs,
@@ -460,6 +461,8 @@ def main():
                        choices=['greedy', 'bayesian', 'hyperband', 'random'],
                        help='AutoKeras tuner strategy (default: greedy). '
                             'bayesian recommended for max-trials > 5.')
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume AutoKeras search from existing checkpoints (overwrite=False)')
 
     # Options
     parser.add_argument('--no-plot', action='store_true',
@@ -482,6 +485,7 @@ def main():
             max_grade=args.max_grade,
             model_type=args.model_type,
             tuner=args.tuner,
+            overwrite=not args.resume,
         )
         
         print("\nModel training completed successfully!")
