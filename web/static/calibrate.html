@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MoonBoard Grid Calibrator</title>
+  <style>
+    body { background: #1a1a2e; color: #e0e0e0; font-family: sans-serif; margin: 1rem; }
+    .layout { display: flex; gap: 1.5rem; align-items: flex-start; }
+    .board { position: relative; display: inline-block; line-height: 0; }
+    .board img { display: block; border: 2px solid #333; }
+    .board canvas { position: absolute; top: 2px; left: 2px; }
+    .controls { min-width: 300px; }
+    .control-group { margin-bottom: 1rem; }
+    .control-group label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.3rem; }
+    .control-row { display: flex; align-items: center; gap: 0.5rem; }
+    .control-row input[type=range] { flex: 1; }
+    .control-row .val { min-width: 40px; text-align: right; font-family: monospace; font-size: 0.9rem; }
+    button { background: #e2b714; color: #1a1a2e; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-weight: 600; margin-top: 0.5rem; }
+    button:hover { background: #f0c830; }
+    .output { background: #16213e; padding: 1rem; border-radius: 4px; margin-top: 1rem; font-family: monospace; font-size: 0.85rem; white-space: pre; }
+    h1 { color: #e2b714; font-size: 1.2rem; margin-bottom: 1rem; }
+    h3 { color: #e2b714; font-size: 1rem; margin-bottom: 0.5rem; }
+    .hint { font-size: 0.8rem; color: #666; margin-top: 0.3rem; }
+  </style>
+</head>
+<body>
+  <h1>MoonBoard Grid Calibrator</h1>
+  <div class="layout">
+    <div class="board">
+      <img id="img" src="/api/board-image" alt="MoonBoard" />
+      <canvas id="canvas"></canvas>
+    </div>
+    <div class="controls">
+      <h3>Grid Boundaries (native px)</h3>
+
+      <div class="control-group">
+        <label>Left (col A left edge)</label>
+        <div class="control-row">
+          <input type="range" id="sl-left" min="0" max="120" value="52" step="1">
+          <span class="val" id="v-left">52</span>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label>Right (col K right edge)</label>
+        <div class="control-row">
+          <input type="range" id="sl-right" min="580" max="665" value="650" step="1">
+          <span class="val" id="v-right">650</span>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label>Top (row 18 top edge)</label>
+        <div class="control-row">
+          <input type="range" id="sl-top" min="0" max="120" value="50" step="1">
+          <span class="val" id="v-top">50</span>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label>Bottom (row 1 bottom edge)</label>
+        <div class="control-row">
+          <input type="range" id="sl-bottom" min="900" max="1023" value="992" step="1">
+          <span class="val" id="v-bottom">992</span>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label>Dot radius</label>
+        <div class="control-row">
+          <input type="range" id="sl-radius" min="2" max="20" value="5" step="1">
+          <span class="val" id="v-radius">5</span>
+        </div>
+      </div>
+
+      <p class="hint">Adjust sliders until red dots sit on hold bolt centres across all rows and columns.</p>
+
+      <div class="output" id="output">const GRID = {
+  left: 52,
+  right: 650,
+  top: 50,
+  bottom: 992,
+  cols: 11,
+  rows: 18,
+};</div>
+    </div>
+  </div>
+
+  <script>
+    const img = document.getElementById("img");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const sliders = {
+      left:   document.getElementById("sl-left"),
+      right:  document.getElementById("sl-right"),
+      top:    document.getElementById("sl-top"),
+      bottom: document.getElementById("sl-bottom"),
+      radius: document.getElementById("sl-radius"),
+    };
+    const vals = {
+      left:   document.getElementById("v-left"),
+      right:  document.getElementById("v-right"),
+      top:    document.getElementById("v-top"),
+      bottom: document.getElementById("v-bottom"),
+      radius: document.getElementById("v-radius"),
+    };
+    const output = document.getElementById("output");
+
+    function getGrid() {
+      return {
+        left:   parseInt(sliders.left.value),
+        right:  parseInt(sliders.right.value),
+        top:    parseInt(sliders.top.value),
+        bottom: parseInt(sliders.bottom.value),
+      };
+    }
+
+    function draw() {
+      const g = getGrid();
+      const radius = parseInt(sliders.radius.value);
+      const cols = 11, rows = 18;
+      const colStep = (g.right - g.left) / cols;
+      const rowStep = (g.bottom - g.top) / rows;
+
+      // Update value displays
+      vals.left.textContent = g.left;
+      vals.right.textContent = g.right;
+      vals.top.textContent = g.top;
+      vals.bottom.textContent = g.bottom;
+      vals.radius.textContent = radius;
+
+      // Size canvas to image content
+      const w = img.clientWidth;
+      const h = img.clientHeight;
+      canvas.width = w;
+      canvas.height = h;
+      canvas.style.width = w + "px";
+      canvas.style.height = h + "px";
+
+      const sx = w / (img.naturalWidth || 665);
+      const sy = h / (img.naturalHeight || 1023);
+
+      ctx.clearRect(0, 0, w, h);
+
+      for (let col = 0; col < cols; col++) {
+        for (let row = 0; row < rows; row++) {
+          const nx = g.left + colStep * (col + 0.5);
+          const ny = g.bottom - rowStep * (row + 0.5);
+          const x = nx * sx;
+          const y = ny * sy;
+          const r = radius * sx;
+
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.strokeStyle = "red";
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          // Cross hair
+          ctx.beginPath();
+          ctx.moveTo(x - r, y);
+          ctx.lineTo(x + r, y);
+          ctx.moveTo(x, y - r);
+          ctx.lineTo(x, y + r);
+          ctx.strokeStyle = "rgba(255,0,0,0.5)";
+          ctx.lineWidth = 0.75;
+          ctx.stroke();
+        }
+      }
+
+      // Update output
+      output.textContent = `const GRID = {\n  left: ${g.left},\n  right: ${g.right},\n  top: ${g.top},\n  bottom: ${g.bottom},\n  cols: 11,\n  rows: 18,\n};`;
+    }
+
+    // Bind sliders
+    for (const s of Object.values(sliders)) {
+      s.addEventListener("input", draw);
+    }
+
+    // Draw once image loads
+    if (img.complete) { draw(); } else { img.addEventListener("load", draw); }
+    window.addEventListener("resize", draw);
+  </script>
+</body>
+</html>

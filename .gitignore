@@ -21,6 +21,9 @@ moonboard_model/
 image_regressor/
 model_output/
 
+# Claude
+.claude/settings.local.json
+
 # OS
 .DS_Store
 Thumbs.db
