@@ -39,6 +39,7 @@ nav { display: flex; gap: 0.6rem; }
 }
 .nav-btn:hover { color: #fff; border-color: #e2b714; }
 .nav-btn.active { background: #e2b714; color: #1a1a2e; border-color: #e2b714; font-weight: 600; }
+.github-link { display: inline-flex; align-items: center; gap: 0.45rem; text-decoration: none; }
 
 /* --- Views --- */
 .view { display: none; padding: 2rem 3rem; }
